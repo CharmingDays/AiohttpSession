@@ -1,119 +1,172 @@
 import typing
 import aiohttp
-import asyncio
 
 
-
-
-class AioClientSession(object):
-    """A wrapper class for aiohttp.ClientSession.
-
-    This class provides a convenient way to manage an aiohttp.ClientSession
-    by encapsulating its creation, usage, and cleanup.
-
-    Args:
-        object (type): The base class for this class.
-
-    Attributes:
-        session (aiohttp.ClientSession): The aiohttp.ClientSession instance.
-
-    """
-
-    def __init__(self):
-        self.session: aiohttp.ClientSession = aiohttp.ClientSession()
-
-    async def __aenter__(self):
-        return self.session
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if not self.session.closed:
-            await self.session.close()
-
-    async def close(self):
-        if not self.session.closed:
-            await self.session.close()
-
-    async def request(self, method: str, url: str, should_read=False, **kwargs):
-        """Send an HTTP request.
-
-        Args:
-            method (str): The HTTP method to use (e.g., 'GET', 'POST').
-            url (str): The URL to send the request to.
-            should_read (bool, optional): Whether to read the response content. Defaults to False. If false, the session will be closed after the request is made
-            **kwargs: Additional keyword arguments to pass to aiohttp.ClientSession.request().
-
-        Returns:
-            aiohttp.ClientResponse: The response object.
-
-        """
-        async with self.session.request(method, url, **kwargs) as response:
-            if should_read:
-                await response.read()
-            return response
-
-    async def get(self, url: str, should_read=False, **kwargs):
-        """Send a GET request.
-
-        Args:
-            url (str): The URL to send the request to.
-            should_read (bool, optional): Whether to read the response content. Defaults to False.
-            **kwargs: Additional keyword arguments to pass to aiohttp.ClientSession.request().
-
-        Returns:
-            aiohttp.ClientResponse: The response object.
-
-        """
-        return await self.request('GET', url, should_read, **kwargs)
-
-    async def post(self, url: str, should_read=False, **kwargs):
-        """Send a POST request.
-
-        Args:
-            url (str): The URL to send the request to.
-            should_read (bool, optional): Whether to read the response content. Defaults to False.
-            **kwargs: Additional keyword arguments to pass to aiohttp.ClientSession.request().
-
-        Returns:
-            aiohttp.ClientResponse: The response object.
-
-        """
-        return await self.request('POST', url, should_read, **kwargs)
-
-    async def multi_request(self, method: typing.Callable, urls: typing.List[str], should_read=False, **kwargs):
-        """Send multiple requests concurrently.
-
-        Args:
-            method (Callable): The request method to use (e.g., self.get, self.post).
-            urls (List[str]): The URLs to send the requests to.
-            should_read (bool, optional): Whether to read the response content. Defaults to False.
-            **kwargs: Additional keyword arguments to pass to the request method.
-
-        Returns:
-            List[aiohttp.ClientResponse]: The list of response objects.
-
-        """
-        return await asyncio.gather(*[method(url, should_read, **kwargs) for url in urls])
+class AioSessionBase(object):
+    def __init__(self) -> None:
+        self.session = aiohttp.ClientSession()
     
 
 
-async def with_context_manager(url:str):
-    async with AioClientSession() as session:
-        response = await session.get(url, should_read=True)
-        print(await response.text())
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self,exc_type,exc_val,exc_tb):
+        if not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+
+    async def close_session(self)->None:
+        if not self.session.closed:
+            await self.session.close()
+        self.session = None
+
+
+    async def request(self,method:str,url:str,**kwargs) -> aiohttp.ClientResponse:
+        should_read = kwargs.pop("should_read",True)
+        async with self.session.request(method,url,**kwargs) as response:
+            if not should_read:
+                await response
+            return await response.json()
+        
 
 
 
-async def without_context_manager(url:str):
-    session = AioClientSession()
-    try:
-        response = await session.get(url, should_read=True)
-        print(await response.text())
-    except Exception as e:
-        # handle exception
-        print(e)
-    finally:
-        await session.close()
+class aioSessionHandler(object):
+    def __init__(self):
+        self.all_sessions:typing.Dict[int,AioSessionBase] = {}
+        self.current_session:AioSessionBase = AioSessionBase()
+        self.all_sessions.update({id(self.current_session):self.current_session})
+
+    async def __aenter__(self):
+        return self
+    
+
+    async def __aexit__(self,exc_type,exc_val,exc_tb):
+        await self.close_all_sessions()
 
 
+    async def request(self,method:str,url:str,**kwargs) -> aiohttp.ClientResponse:
+        return await self.current_session.request(method,url,**kwargs)
+    
 
-asyncio.run(without_context_manager('https://nekos.life/api/v2/img/neko'))
+    async def create_session(self,counts:int=1) -> None:
+        for _ in range(counts):
+            session = AioSessionBase()
+            self.all_sessions.update({id(session):session})
+
+
+    async def update_cookies(self,cookies:aiohttp.CookieJar,base_session:AioSessionBase=None) -> None:
+        if base_session is None:
+            base_session:AioSessionBase = self.current_session
+        base_session.session.cookie_jar.update_cookies(cookies)
+        
+
+
+    async def clone_sessions(self,counts:int=1) -> None:
+        """Clones the current session's cookies, headers to new session objects
+
+        Args:
+            counts (int, optional): The number of aioSessionBase to create. Defaults to 1.
+        """
+        for _ in range(counts):
+            base_session = AioSessionBase()
+            base_session.session.headers.update(self.current_session.headers)
+            base_session.session.cookie_jar.update_cookies(self.current_session.cookie_jar)
+            self.all_sessions.update({id(base_session):base_session})
+
+    async def close_session(self,object_id:int) -> None:
+        """Close a session object with given ID
+
+        Args:
+            object_id (int): the id of the session object to close
+
+        Raises:
+            KeyError: ID not found in the session object dict
+        """
+        session:AioSessionBase = self.all_sessions.pop(object_id,None)
+        if session:
+            await session.close_session()
+        else:
+            raise KeyError("Session object with given ID not found",object_id)
+        
+    async def close_extra_sessions(self):
+        """Closes all session objects except the current session object
+        """
+        current_id = id(self.current_session)
+        keys = self.all_sessions.keys()
+        for key in keys:
+            if current_id == key:
+                # Skip the current session
+                continue
+            else:
+                await self.all_sessions[key].close_session()
+                del self.all_sessions[id]
+
+    async def switch_session(self,object_id:int) -> None:
+        """Switch to a session object with given ID
+
+        Args:
+            object_id (int): the id of the session object to switch to
+
+        Raises:
+            KeyError: ID not found in the session object dict
+        """
+        session = self.all_sessions.get(object_id,None)
+        if session:
+            self.current_session = session
+        else:
+            raise KeyError("Session object with given ID not found",object_id)
+        
+
+    async def switch_to_default_session(self) -> None:
+        """
+        Switch to the default session object.
+        The default session object is the first session object created
+        """
+        self.current_session = self.all_sessions.values()[0]
+    
+
+    async def close_all_sessions(self) -> None:
+        """
+        Close all session objects
+        """
+        for session in self.all_sessions.copy().values():
+            await session.close_session()
+        self.all_sessions.clear()
+        self.current_session = None
+
+    async def close_current_session(self) -> None:
+        """
+        Close the current session object and switches it to the next available
+        session object in the dict
+        """
+        current_session:AioSessionBase = self.all_sessions.pop(id(self.current_session),None)
+        await current_session.close_session()
+        new_session:AioSessionBase = self.all_sessions.values()[0]
+        self.current_session:AioSessionBase = new_session
+
+    async def split_request(self,request_options:typing.List[typing.Dict]) -> aiohttp.ClientResponse:
+        """
+        Splits the request into multiple requests and returns the response of the last request
+
+        Args:
+            options (typing.List[typing.Dict]): The list of request options to split passed as a dict object per request
+
+        Returns:
+            aiohttp.ClientResponse: The responses of all the requests
+        """
+        index = 0
+        index_cap = len(self.all_sessions)
+        all_sessions:typing.List[AioSessionBase] = list(self.all_sessions.values())
+        responses:typing.List[aiohttp.ClientResponse] = []
+        while request_options.copy():
+            args = request_options.pop(0)
+            rsp = await all_sessions[index].request(**args)
+            responses.append(rsp)
+            index += 1
+            if index == index_cap:
+                index = 0
+        
+        return responses
